@@ -216,6 +216,70 @@ int mqtt_publish_test(const char *payload)
     return err;
 }
 
+int getPayload(char *payload, size_t payload_len)
+{
+    //const uint8_t request[8] = { 0x01, 0x03, 0x00, 0x20, 0x00, 0x04, 0x45, 0xc3 };
+    const uint8_t request[8] = { 0x01, 0x03, 0x00, 0x17, 0x00, 0x07, 0xB4, 0x0C };
+    uint8_t response[32];
+
+    printk("Sending Modbus request...\n");
+    uart_send_bytes(request, sizeof(request));
+
+    memset(response, 0, sizeof(response));
+    int n = uart_read_bytes(response, sizeof(response), 500);
+
+    printk("Got %d bytes\n", n);
+    for (int i = 0; i < n; i++) {
+        printk("%02X ", response[i]);
+    }
+    printk("\n");
+
+    if (n < 17) {
+        return -1;
+    }
+
+    uint16_t flow = ((uint16_t)response[3] << 8) | response[4];
+    uint16_t battery = ((uint16_t)response[5] << 8) | response[6];
+    uint16_t solar = ((uint16_t)response[7] << 8) | response[8];
+
+    uint32_t peak =
+        ((uint32_t)response[9] << 24) |
+        ((uint32_t)response[10] << 16) |
+        ((uint32_t)response[11] << 8) |
+        response[12];
+
+    uint32_t offpeak =
+        ((uint32_t)response[13] << 24) |
+        ((uint32_t)response[14] << 16) |
+        ((uint32_t)response[15] << 8) |
+        response[16];
+
+    int now_ms = (int)k_uptime_get();
+
+    int len = snprintf(payload, payload_len,
+        "{"
+        "\"d\":\"nrf1\","
+        "\"p\":%u,"
+        "\"o\":%u,"
+        "\"f\":%u,"
+        "\"b\":%u,"
+        "\"s\":%u,"
+        "\"t\":%d"
+        "}",
+        peak,
+        offpeak,
+        flow,
+        battery,
+        solar,
+        now_ms);
+
+    if (len < 0 || len >= (int)payload_len) {
+        return -2;
+    }
+
+    return 0;
+}
+
 int main(void)
 {    
     printk("Initialising modem...\n");
@@ -265,27 +329,13 @@ int main(void)
         //run_at("AT+COPS?");
         //run_at("AT+CGPADDR");
 
-        uint32_t peak_value = 0;
-        uint32_t offpeak_value = 0;
-        uint16_t flow = 7;
         char payload[256];
-        snprintf(payload,
-            sizeof(payload),
-            "{"
-            "\"d\":\"nrf1\","
-            "\"p\":%u,"
-            "\"o\":%u,"
-            "\"f\":%u,"
-            "\"t\":%lld"
-            "}",
-            peak_value,
-            offpeak_value,
-            flow,
-            now_ms);
-        err = mqtt_publish_test(payload);
-        if (err) {
-            printk("Publish failed: %d\n", err);
-        }
+        if (getPayload(payload, sizeof(payload)) == 0) {
+            err = mqtt_publish_test(payload);
+            if (err) {
+                printk("Publish failed: %d\n", err);
+            }
+        }        
 
         err = lte_lc_power_off(); //err = lte_lc_func_mode_set(LTE_LC_FUNC_MODE_POWER_OFF);
         if (err) {
@@ -300,54 +350,4 @@ int main(void)
 
         sleep_until_next_wakeup(); 
     }
-/*
-    //const uint8_t request[8] = { 0x01, 0x03, 0x00, 0x20, 0x00, 0x04, 0x45, 0xc3 };
-    const uint8_t request[8] = { 0x01, 0x03, 0x00, 0x17, 0x00, 0x07, 0xb4, 0x0c };
-    uint8_t response[32];
-    int64_t next_ms = k_uptime_get() + INTERVAL_MS;
-
-    while (1) {
-        printk("Sending Modbus request...\n");
-        uart_send_bytes(request, sizeof(request));
-
-        memset(response, 0, sizeof(response));
-        int n = uart_read_bytes(response, sizeof(response), 500);
-
-        printk("Got %d bytes\n", n);
-        for (int i = 0; i < n; i++) {
-            printk("%02X ", response[i]);
-        }
-        printk("\n");
-
-        uint16_t flow = ((uint16_t)response[3] << 8)  |
-            response[4];
-
-        uint16_t battery = ((uint16_t)response[5] << 8)  |
-            response[6];
-
-        uint16_t solar = ((uint16_t)response[7] << 8)  |
-            response[8];
-
-        uint32_t peak =
-            ((uint32_t)response[9] << 24) |
-            ((uint32_t)response[10] << 16) |
-            ((uint32_t)response[11] << 8)  |
-            response[12];
-
-        uint32_t offpeak =
-            ((uint32_t)response[13] << 24) |
-            ((uint32_t)response[14] << 16) |
-            ((uint32_t)response[15] << 8)  |
-            response[16];
-
-        printk("Flow = %u\n", flow);
-        printk("Battery = %u\n", battery);
-        printk("Solar = %u\n", solar);
-        printk("Peak totaliser = %u\n", peak);
-        printk("Off-peak totaliser = %u\n", offpeak);
-
-        next_ms += 60000;
-        k_sleep(K_TIMEOUT_ABS_MS(next_ms));
-    }
-    */
 }
