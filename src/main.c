@@ -1,8 +1,15 @@
 /*
- * Copyright (c) 2012-2014 Wind River Systems, Inc.
- * Copyright (c) 2016-2026 Makerdiary <https://makerdiary.com>
- *
- * SPDX-License-Identifier: Apache-2.0
+todo
+->remove print, or actually log, so we can read errors later, obtain log file, like when timesteps are missing, can read historical logs
+->obtain meter resets
+->full sleep shutdown, use rtc to wake up/turn on again for daily
+->de power the rs232 transceiver, like power with digital output maybe, and set to no voltage to turn off
+->psm mode, leave modem on and maybe connected, investigate for 15 min
+->pulse input to wake from deep sleep, change to 15minute rate, change back to daily when stop watering
+->ring buffer, flash memory, non volatilve or persistent memory
+->compress/zip the payload maybe
+->receive config updates over the air COTA
+->use async lte_lc_connect and wait, as current is blocking if antenna not connected lte_lc_connect_async(lte_handler); with semaphore
  */
 
 #include <stdio.h>
@@ -13,6 +20,7 @@
 #include <date_time.h>
 
 #include <modem/nrf_modem_lib.h>
+#include <modem/modem_info.h>
 #include <nrf_modem_at.h>
 #include <modem/lte_lc.h>
 #include <zephyr/net/socket.h>
@@ -20,7 +28,7 @@
 
 #define MB_UART_NODE DT_NODELABEL(uart1)
 #define INTERVAL_MS 60000
-#define SLEEP_INTERVAL_S (15 * 60)
+#define SLEEP_INTERVAL_S (60 * 60)
 
 static const struct device *mb_uart = DEVICE_DT_GET(MB_UART_NODE);
 
@@ -128,7 +136,7 @@ static void mqtt_evt_handler(struct mqtt_client *const client,
     }
 }
 
-int mqtt_publish_test(const char *payload)
+int mqtt_publish_method(const char *payload)
 {
     int err;
 
@@ -219,7 +227,7 @@ int mqtt_publish_test(const char *payload)
 int getPayload(char *payload, size_t payload_len)
 {
     //const uint8_t request[8] = { 0x01, 0x03, 0x00, 0x20, 0x00, 0x04, 0x45, 0xc3 };
-    const uint8_t request[8] = { 0x01, 0x03, 0x00, 0x17, 0x00, 0x07, 0xB4, 0x0C };
+    const uint8_t request[8] = { 0x1, 0x3, 0x0, 0x1d, 0x0, 0x7, 0x94, 0xe };
     uint8_t response[32];
 
     printk("Sending Modbus request...\n");
@@ -242,6 +250,10 @@ int getPayload(char *payload, size_t payload_len)
     uint16_t battery = ((uint16_t)response[5] << 8) | response[6];
     uint16_t solar = ((uint16_t)response[7] << 8) | response[8];
 
+    printk("%u\n", flow);
+    printk("%u\n", battery);
+    printk("%u\n", solar);
+
     uint32_t peak =
         ((uint32_t)response[9] << 24) |
         ((uint32_t)response[10] << 16) |
@@ -254,7 +266,21 @@ int getPayload(char *payload, size_t payload_len)
         ((uint32_t)response[15] << 8) |
         response[16];
 
-    int now_ms = (int)k_uptime_get();
+    short rsrp = -127;   // sensible default
+    int err = modem_info_short_get(MODEM_INFO_RSRP, &rsrp);
+    if (err) {
+        printk("Failed to get RSRP: %d\n", err);
+    } else {
+        printk("RSRP = %d dBm\n", rsrp);
+    }
+
+    int64_t now_ms;
+    if (date_time_is_valid() && date_time_now(&now_ms) == 0) {
+        // use UTC timestamp
+    } else {
+        now_ms = k_uptime_get();
+        // use uptime as fallback
+    }
 
     int len = snprintf(payload, payload_len,
         "{"
@@ -264,14 +290,23 @@ int getPayload(char *payload, size_t payload_len)
         "\"f\":%u,"
         "\"b\":%u,"
         "\"s\":%u,"
-        "\"t\":%d"
+        "\"q\":%d,"
+        "\"t\":%lld"
         "}",
         peak,
         offpeak,
         flow,
         battery,
         solar,
-        now_ms);
+        rsrp,
+        (long long)now_ms);
+
+    printk("%s\n", payload);
+
+    if (len < 0 || len >= payload_len) {
+        printk("Payload truncated\n");
+        return -ENOMEM;
+    }
 
     if (len < 0 || len >= (int)payload_len) {
         return -2;
@@ -290,23 +325,34 @@ int main(void)
         printk("Modem init failed\n");
         return 0;
     }
+    
+    err = modem_info_init();
+    if (err) {
+        printk("modem_info_init failed: %d\n", err);
+    }
 
     while (1)
     {
+        /*char payload2[256];
+        getPayload(payload2, sizeof(payload2));
+        sleep_until_next_wakeup();
+        continue;*/
+
         //run_at("AT");
         err = lte_lc_normal(); //int err = lte_lc_func_mode_set(LTE_LC_FUNC_MODE_NORMAL); //run_at("AT+CFUN=1");
         if (err) {
             printk("Failed to set normal mode: %d\n", err);
         }
-
+        printk("Before LTE connect\n");
         err = lte_lc_connect();
+        printk("After LTE connect, err=%d\n", err);
         if (err) {
             printk("Failed to connect network: %d\n", err);
             lte_lc_power_off();
             sleep_until_next_wakeup();
             continue;
         }
-        
+      
         err = date_time_update_async(NULL);
         if (err) {
             printk("Failed to request network time: %d\n", err);
@@ -331,7 +377,7 @@ int main(void)
 
         char payload[256];
         if (getPayload(payload, sizeof(payload)) == 0) {
-            err = mqtt_publish_test(payload);
+            err = mqtt_publish_method(payload);
             if (err) {
                 printk("Publish failed: %d\n", err);
             }
