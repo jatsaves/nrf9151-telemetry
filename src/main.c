@@ -10,6 +10,23 @@ todo
 ->compress/zip the payload maybe
 ->receive config updates over the air COTA
 ->use async lte_lc_connect and wait, as current is blocking if antenna not connected lte_lc_connect_async(lte_handler); with semaphore
+-> crc check, and also these sanity checks
+if (n < 19) {
+    printk("Short response: %d bytes\n", n);
+    return -1;
+}
+if (response[0] != 0x01 ||
+    response[1] != 0x03 ||
+    response[2] != 0x0E) {
+    printk("Unexpected Modbus frame\n");
+    return -1;
+}
+->mqtt publish raw modbus response packet/bytes too
+->system off, will lose memeory data, if not RETAIN config, or write to flahs, or eeprom
+->avoid writing to flash, to reduce wear. there is system off retain ram, if want to use when system off [deepest sleep]
+->ai suggests not too SYSTEM OFF
+->ring buffer in memory, if publish fail, store and send on next poll
+->only tiimesync daily, not hourly
  */
 
 #include <stdio.h>
@@ -29,6 +46,8 @@ todo
 #define MB_UART_NODE DT_NODELABEL(uart1)
 #define INTERVAL_MS 60000
 #define SLEEP_INTERVAL_S (60 * 60)
+
+#define FW_VERSION "0.5.0"
 
 static const struct device *mb_uart = DEVICE_DT_GET(MB_UART_NODE);
 
@@ -266,12 +285,14 @@ int getPayload(char *payload, size_t payload_len)
         ((uint32_t)response[15] << 8) |
         response[16];
 
-    short rsrp = -127;   // sensible default
-    int err = modem_info_short_get(MODEM_INFO_RSRP, &rsrp);
+    short rsrp_idx = 0;
+    int16_t rsrp_dbm = -127; // sensible default
+    int err = modem_info_short_get(MODEM_INFO_RSRP, &rsrp_idx);
     if (err) {
         printk("Failed to get RSRP: %d\n", err);
     } else {
-        printk("RSRP = %d dBm\n", rsrp);
+        rsrp_dbm = RSRP_IDX_TO_DBM(rsrp_idx);
+        printk("RSRP = %d dBm (idx=%d)\n", rsrp_dbm, rsrp_idx);
     }
 
     int64_t now_ms;
@@ -285,6 +306,7 @@ int getPayload(char *payload, size_t payload_len)
     int len = snprintf(payload, payload_len,
         "{"
         "\"d\":\"nrf1\","
+        "\"v\":\"" FW_VERSION "\","
         "\"p\":%u,"
         "\"o\":%u,"
         "\"f\":%u,"
@@ -298,7 +320,7 @@ int getPayload(char *payload, size_t payload_len)
         flow,
         battery,
         solar,
-        rsrp,
+        rsrp_dbm, // send dBm, not index
         (long long)now_ms);
 
     printk("%s\n", payload);
@@ -367,6 +389,7 @@ int main(void)
             printk("Current UTC time: %lld ms\n", now_ms);
         } else {
             printk("No valid time available\n");
+            now_ms = k_uptime_get();
         }
 
         //k_sleep(K_SECONDS(20));
@@ -376,12 +399,22 @@ int main(void)
         //run_at("AT+CGPADDR");
 
         char payload[256];
-        if (getPayload(payload, sizeof(payload)) == 0) {
-            err = mqtt_publish_method(payload);
-            if (err) {
-                printk("Publish failed: %d\n", err);
-            }
+        int rc = getPayload(payload, sizeof(payload));
+        if (rc != 0) {
+            snprintf(payload, sizeof(payload),
+                "{"
+                "\"d\":\"nrf1\","
+                "\"v\":\"" FW_VERSION "\","
+                "\"err\":%d,"
+                "\"t\":%lld"
+                "}",
+                rc,
+                (long long)now_ms);
         }        
+        err = mqtt_publish_method(payload);
+        if (err) {
+            printk("Publish failed: %d\n", err);
+        }
 
         err = lte_lc_power_off(); //err = lte_lc_func_mode_set(LTE_LC_FUNC_MODE_POWER_OFF);
         if (err) {
