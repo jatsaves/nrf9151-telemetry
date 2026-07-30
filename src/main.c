@@ -48,7 +48,7 @@ if (response[0] != 0x01 ||
 #define INTERVAL_MS 60000
 #define SLEEP_INTERVAL_S (60 * 60)
 
-#define FW_VERSION "0.5.1"
+#define FW_VERSION "0.5.2"
 
 static const struct device *mb_uart = DEVICE_DT_GET(MB_UART_NODE);
 
@@ -244,10 +244,6 @@ int mqtt_publish_method(const char *payload)
     return err;
 }
 
-void rsrp_cb(char rsrp_value)
-{ //empty
-}
-
 int getPayload(char *payload, size_t payload_len)
 {
     //const uint8_t request[8] = { 0x01, 0x03, 0x00, 0x20, 0x00, 0x04, 0x45, 0xc3 };
@@ -300,9 +296,10 @@ int getPayload(char *payload, size_t payload_len)
 
     short rsrp_idx = 0;
     int16_t rsrp_dbm = -127; // sensible default
-    int err = modem_info_short_get(MODEM_INFO_RSRP, &rsrp_idx);
-    if (err) {
-        printk("Failed to get RSRP (err=%d, idx=%d)\n", err, rsrp_idx);
+    // Rename 'err' to 'ret' (return value) since it returns length on success
+    int ret = modem_info_short_get(MODEM_INFO_RSRP, &rsrp_idx);
+    if (ret < 0) { // <--- Only negative numbers are errors!
+        printk("Failed to get RSRP (err=%d, idx=%d)\n", ret, rsrp_idx);
     } else {
         rsrp_dbm = RSRP_IDX_TO_DBM(rsrp_idx);
         printk("RSRP = %d dBm (idx=%d)\n", rsrp_dbm, rsrp_idx);
