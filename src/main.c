@@ -27,6 +27,7 @@ if (response[0] != 0x01 ||
 ->ai suggests not too SYSTEM OFF
 ->ring buffer in memory, if publish fail, store and send on next poll
 ->only tiimesync daily, not hourly
+->return any error in the payload for success too, handle on server side
  */
 
 #include <stdio.h>
@@ -47,7 +48,7 @@ if (response[0] != 0x01 ||
 #define INTERVAL_MS 60000
 #define SLEEP_INTERVAL_S (60 * 60)
 
-#define FW_VERSION "0.5.0"
+#define FW_VERSION "0.5.1"
 
 static const struct device *mb_uart = DEVICE_DT_GET(MB_UART_NODE);
 
@@ -243,6 +244,10 @@ int mqtt_publish_method(const char *payload)
     return err;
 }
 
+void rsrp_cb(char rsrp_value)
+{ //empty
+}
+
 int getPayload(char *payload, size_t payload_len)
 {
     //const uint8_t request[8] = { 0x01, 0x03, 0x00, 0x20, 0x00, 0x04, 0x45, 0xc3 };
@@ -285,22 +290,22 @@ int getPayload(char *payload, size_t payload_len)
         ((uint32_t)response[15] << 8) |
         response[16];
 
-    short rsrp_idx = 0;
-    int16_t rsrp_dbm = -127; // sensible default
-    int err = modem_info_short_get(MODEM_INFO_RSRP, &rsrp_idx);
-    if (err) {
-        printk("Failed to get RSRP: %d\n", err);
-    } else {
-        rsrp_dbm = RSRP_IDX_TO_DBM(rsrp_idx);
-        printk("RSRP = %d dBm (idx=%d)\n", rsrp_dbm, rsrp_idx);
-    }
-
     int64_t now_ms;
     if (date_time_is_valid() && date_time_now(&now_ms) == 0) {
         // use UTC timestamp
     } else {
         now_ms = k_uptime_get();
         // use uptime as fallback
+    }
+
+    short rsrp_idx = 0;
+    int16_t rsrp_dbm = -127; // sensible default
+    int err = modem_info_short_get(MODEM_INFO_RSRP, &rsrp_idx);
+    if (err) {
+        printk("Failed to get RSRP (err=%d, idx=%d)\n", err, rsrp_idx);
+    } else {
+        rsrp_dbm = RSRP_IDX_TO_DBM(rsrp_idx);
+        printk("RSRP = %d dBm (idx=%d)\n", rsrp_dbm, rsrp_idx);
     }
 
     int len = snprintf(payload, payload_len,
@@ -352,6 +357,8 @@ int main(void)
     if (err) {
         printk("modem_info_init failed: %d\n", err);
     }
+
+    modem_info_rsrp_register(rsrp_cb); //to obtain signal strength
 
     while (1)
     {
