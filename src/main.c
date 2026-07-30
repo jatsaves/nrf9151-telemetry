@@ -355,8 +355,6 @@ int main(void)
         printk("modem_info_init failed: %d\n", err);
     }
 
-    modem_info_rsrp_register(rsrp_cb); //to obtain signal strength
-
     while (1)
     {
         /*char payload2[256];
