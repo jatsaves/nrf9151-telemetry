@@ -43,7 +43,7 @@ todo
 #define MB_UART_NODE DT_NODELABEL(uart1)
 #define SLEEP_INTERVAL_S (60 * 60)
 
-#define FW_VERSION "0.6.1"
+#define FW_VERSION "0.6.2"
 #define DEVICE_NAME "nrf1"
 #define MQTT_TOPIC "devices/" DEVICE_NAME
 #define EVENT_COLD_BOOT 1000
@@ -61,10 +61,6 @@ static uint8_t tx_buffer[1024];
 #define MEASUREMENT_HISTORY_SIZE 10
 #define ERROR_HISTORY_SIZE 10
 #define ERROR_MSG_LEN      64
-
-typedef int  (*build_payload_fn_t)(char *buf, size_t len);
-typedef void (*clear_queue_fn_t)(void);
-typedef uint8_t (*count_queue_fn_t)(void);
 
 static bool mqtt_connected;
 
@@ -188,7 +184,7 @@ static const error_entry_t *error_log_get(uint8_t i)
     return &error_log[index];
 }
 
-static int build_measurement_payload(char *buf, size_t len)
+static int build_payload(char *buf, size_t len)
 {
     int written;
 
@@ -202,8 +198,9 @@ static int build_measurement_payload(char *buf, size_t len)
 
     size_t pos = (size_t)written;
 
-    uint8_t count = measurement_log_count();
-    for (uint8_t i = 0; i < count; i++) {
+    uint8_t num_measurements = measurement_log_count();
+    
+    for (uint8_t i = 0; i < num_measurements; i++) {
 
         const measurement_t *m = measurement_log_get(i);
         if (m == NULL) {
@@ -239,44 +236,37 @@ static int build_measurement_payload(char *buf, size_t len)
         pos += (size_t)written;
     }
 
-    written = snprintf(buf + pos, len - pos, "]}");
-
+    written = snprintf(buf + pos,
+                       len - pos,
+                       "],\"errors\":[");
     if (written < 0 || (size_t)written >= (len - pos))
         return -ENOMEM;
 
-    return 0;
-}
+    pos += (size_t)written;
 
-static int build_error_payload(char *buf, size_t len)
-{
-    int written = 0;
+    uint8_t num_errors = error_log_count();
 
-    written = snprintf(buf, len,
-        "{"
-        "\"d\":\"" DEVICE_NAME "\","
-        "\"v\":\"" FW_VERSION "\","
-        "\"errors\":[");
-    if (written < 0 || (size_t)written >= len)
-        return -ENOMEM;
-
-    size_t pos = (size_t)written;
-
-    uint8_t count = error_log_count();
-    for (uint8_t i = 0; i < count; i++) {
+    for (uint8_t i = 0; i < num_errors; i++) {
 
         const error_entry_t *e = error_log_get(i);
         if (e == NULL) {
             return -EINVAL;
         }
 
-        written = snprintf(buf + pos,
-                   len - pos,
-                   "%s{\"t\":%lld,\"utc\":%s,\"c\":%d,\"m\":\"%s\"}",
-                   (i == 0) ? "" : ",",
-                   (long long)e->timestamp,
-                   e->utc_valid ? "true" : "false",
-                   (int)e->error_code,
-                   e->message);
+        written = snprintf(
+            buf + pos,
+            len - pos,
+            "%s{"
+            "\"t\":%lld,"
+            "\"utc\":%s,"
+            "\"c\":%d,"
+            "\"m\":\"%s\""
+            "}",
+            (i == 0) ? "" : ",",
+            (long long)e->timestamp,
+            e->utc_valid ? "true" : "false",
+            (int)e->error_code,
+            e->message);
 
         if (written < 0 || (size_t)written >= (len - pos))
             return -ENOMEM;
@@ -691,67 +681,31 @@ int update_signal(measurement_t *m)
     return 0;
 }
 
-static int publish_log(const char *name,
-                         build_payload_fn_t build,
-                         count_queue_fn_t count,
-                         clear_queue_fn_t clear,
-                         bool log_errors)
+static int publish_logs(void)
 {
-    if (count() == 0) {
+    if (measurement_log_count() == 0 &&
+        error_log_count() == 0) {
         return 0;
     }
 
-    char payload[1024];
+    char payload[1536];
 
-    int err = build(payload, sizeof(payload));
+    int err = build_payload(payload, sizeof(payload));
     if (err) {
-        printk("%s payload build failed: %d\n", name, err);
-
-        if (log_errors) {
-            error_log_add(err,
-                          "%s payload build failed: %d",
-                          name, err);
-        }
-
+        printk("Payload build failed: %d\n", err);
         return err;
     }
 
     err = mqtt_publish_method(payload);
     if (err) {
-        printk("%s publish failed: %d\n", name, err);
-
-        if (log_errors) {
-            error_log_add(err,
-                          "%s publish failed: %d",
-                          name, err);
-        }
-
+        printk("MQTT publish failed: %d\n", err);
         return err;
     }
 
-    clear();
+    measurement_log_clear();
+    error_log_clear();
 
     return 0;
-}
-
-static int publish_measurements(void)
-{
-    return publish_log(
-        "Measurement",
-        build_measurement_payload,
-        measurement_log_count,
-        measurement_log_clear,
-        true);
-}
-
-static int publish_errors(void)
-{
-    return publish_log(
-        "Error",
-        build_error_payload,
-        error_log_count,
-        error_log_clear,
-        false);
 }
 
 static bool first_boot = true;
@@ -839,14 +793,9 @@ int main(void)
         //run_at("AT+COPS?");
         //run_at("AT+CGPADDR");
 
-        err = publish_measurements();
+        err = publish_logs();
         if (err) {
-            printk("Measurement upload failed: %d\n", err);
-        }
-
-        err = publish_errors();
-        if (err) {
-            printk("Error upload failed: %d\n", err);
+            printk("Upload failed: %d\n", err);
         }
 
         err = lte_lc_power_off(); //err = lte_lc_func_mode_set(LTE_LC_FUNC_MODE_POWER_OFF);
