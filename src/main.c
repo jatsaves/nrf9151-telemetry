@@ -1,24 +1,25 @@
 /*
 todo
-->remove print, or actually log, so we can read errors later, obtain log file, like when timesteps are missing, can read historical logs
-->obtain meter resets
-->full sleep shutdown, use rtc to wake up/turn on again for daily
-->de power the rs232 transceiver, like power with digital output maybe, and set to no voltage to turn off
-->psm mode, leave modem on and maybe connected, investigate for 15 min
-->pulse input to wake from deep sleep, change to 15minute rate, change back to daily when stop watering
-->ring buffer, flash memory, non volatilve or persistent memory
-->compress/zip the payload maybe
-->receive config updates over the air COTA
-->use async lte_lc_connect and wait, as current is blocking if antenna not connected lte_lc_connect_async(lte_handler); with semaphore
--> crc check
-->mqtt publish raw modbus response packet/bytes too
-->system off, will lose memeory data, if not RETAIN config, or write to flahs, or eeprom
-->avoid writing to flash, to reduce wear. there is system off retain ram, if want to use when system off [deepest sleep], ai suggests not too SYSTEM OFF
-->only tiimesync daily, not hourly
-->return any error in the payload for success too, handle on server side
+-> obtain meter resets
+-> full sleep shutdown, use rtc to wake up/turn on again for daily
+-> de power the rs232 transceiver, like power with digital output maybe, and set to no voltage to turn off
+-> psm mode, leave modem on and maybe connected, investigate for 15 min
+-> pulse input to wake from deep sleep, change to 15minute rate, change back to daily when stop watering
+-> compress/zip the payload maybe
+-> receive config updates over the air COTA
+-> use async lte_lc_connect and wait, as current is blocking if antenna not connected lte_lc_connect_async(lte_handler); with semaphore
+-> mqtt publish raw modbus response packet/bytes too
+-> system off, will lose memeory data, if not RETAIN config, or write to flahs, or eeprom
+-> avoid writing to flash, to reduce wear. there is system off retain ram, if want to use when system off [deepest sleep], ai suggests not too SYSTEM OFF
+-> only timesync daily, not hourly
 -> preventative reboot....reboot daily or weekly, network issues, memory leaks
+-> watchdog reboot if error
+-> remove excessive print
+-> dump error log
 -> random sleep, say 0-60 seconds, to avoid collisions, then do modbus and mqtt publish
--> mqtts
+-> mqtts, i understand now, should not need to change the blob
+-> modbus retries
+-> different timer for modbus reading, versus publishing
  */
 
 #include <stdint.h>
@@ -42,9 +43,12 @@ todo
 #define MB_UART_NODE DT_NODELABEL(uart1)
 #define SLEEP_INTERVAL_S (60 * 60)
 
-#define FW_VERSION "0.6.0"
+#define FW_VERSION "0.6.1"
 #define DEVICE_NAME "nrf1"
 #define MQTT_TOPIC "devices/" DEVICE_NAME
+#define EVENT_COLD_BOOT 1000
+#define MODBUS_RESPONSE_LEN 19
+#define MODBUS_RETRIES      1
 
 static const struct device *mb_uart = DEVICE_DT_GET(MB_UART_NODE);
 
@@ -83,7 +87,7 @@ typedef struct
 typedef struct
 {
     bool     utc_valid;
-    int64_t  timestamp;    // UTC ms if utc_valid, otherwise uptime ms
+    int64_t  timestamp;    // UTC ms if utc_valid, otherwise oh yeah,uptime ms
     int32_t  error_code;
     char     message[ERROR_MSG_LEN];
 } error_entry_t;
@@ -324,17 +328,47 @@ static int uart_send_bytes(const uint8_t *data, size_t len)
     return 0;
 }
 
-static int uart_read_bytes(uint8_t *buf, size_t max_len, int timeout_ms)
+static int uart_read_bytes(uint8_t *buf,
+                           size_t max_len,
+                           int first_byte_timeout_ms)
 {
+    const int inter_byte_timeout_ms = 10;
+
     int count = 0;
-    int64_t start = k_uptime_get();
+    int64_t timeout;
 
-    while ((k_uptime_get() - start) < timeout_ms && count < max_len) {
-        uint8_t c;
+    /* Wait for the first byte */
+    timeout = k_uptime_get() + first_byte_timeout_ms;
 
-        if (uart_poll_in(mb_uart, &c) == 0) {
-            buf[count++] = c;
+    while (k_uptime_get() < timeout) {
+
+        if (uart_poll_in(mb_uart, &buf[0]) == 0) {
+            count = 1;
+            break;
+        }
+
+        k_sleep(K_MSEC(1));
+    }
+
+    if (count == 0) {
+        return 0;   /* No response */
+    }
+
+    /* Read until no more bytes arrive */
+    timeout = k_uptime_get() + inter_byte_timeout_ms;
+
+    while (count < max_len) {
+
+        if (uart_poll_in(mb_uart, &buf[count]) == 0) {
+            count++;
+
+            /* Another byte arrived, extend timeout */
+            timeout = k_uptime_get() + inter_byte_timeout_ms;
         } else {
+            if (k_uptime_get() >= timeout) {
+                break;
+            }
+
             k_sleep(K_MSEC(1));
         }
     }
@@ -494,36 +528,119 @@ static int mqtt_publish_method(const char *payload)
 
     printk("mqtt_publish = %d\n", err);
 
-    /* Give the modem a chance to transmit the packet */
-    k_sleep(K_SECONDS(5));
+    int64_t end = k_uptime_get() + 500;
+    while (k_uptime_get() < end) {
+        (void)mqtt_input(&client);
+        (void)mqtt_live(&client);
+        k_sleep(K_MSEC(20));
+    }
 
     (void)mqtt_disconnect(&client, NULL);
 
     return 0;
 }
 
-static int getMeasurement(measurement_t *m)
+static uint16_t modbus_crc16(const uint8_t *buf, size_t len)
 {
-    const uint8_t request[8] = { 0x1, 0x3, 0x0, 0x1d, 0x0, 0x7, 0x94, 0xe };
-    uint8_t response[32] = {0};
-    printk("Sending Modbus request...\n");
-    uart_send_bytes(request, sizeof(request));
-    int n = uart_read_bytes(response, sizeof(response), 500);
+    uint16_t crc = 0xFFFF;
 
-    //printk("Got %d bytes\n", n);
-    //for (int i = 0; i < n; i++) {
-    //    printk("%02X ", response[i]);
-    //}
-    //printk("\n");
+    for (size_t pos = 0; pos < len; pos++) {
+        crc ^= buf[pos];
 
-    if (n < 19) {
-        return -EIO;
+        for (int i = 0; i < 8; i++) {
+            if (crc & 1) {
+                crc = (crc >> 1) ^ 0xA001;
+            } else {
+                crc >>= 1;
+            }
+        }
     }
 
-    if (response[0] != 0x01 ||
-        response[1] != 0x03 ||
-        response[2] != 0x0E) {
-        return -EBADMSG;
+    return crc;
+}
+
+static int modbus_read(const uint8_t *request,
+                       size_t request_len,
+                       uint8_t *response,
+                       size_t response_len)
+{
+    int last_err = -EIO;
+
+    for (int attempt = 1; attempt <= MODBUS_RETRIES; attempt++) {
+
+        memset(response, 0, response_len);
+
+        /* Flush any stale UART bytes */
+        uint8_t dummy;
+        while (uart_poll_in(mb_uart, &dummy) == 0) {
+        }
+
+        uart_send_bytes(request, request_len);
+
+        int n = uart_read_bytes(response, response_len, 500);
+
+        if (n < MODBUS_RESPONSE_LEN) {
+            last_err = -EIO;
+
+            if (attempt == MODBUS_RETRIES) {
+                error_log_add(last_err,
+                              "Modbus timeout after %d retries (%d bytes)",
+                              MODBUS_RETRIES,
+                              n);
+            }
+            continue;
+        }
+
+        if (response[0] != 0x01 ||
+            response[1] != 0x03 ||
+            response[2] != 0x0E) {
+
+            last_err = -EBADMSG;
+
+            if (attempt == MODBUS_RETRIES) {
+                error_log_add(last_err,
+                              "Invalid Modbus header");
+            }
+            continue;
+        }
+
+        uint16_t crc_received =
+            ((uint16_t)response[18] << 8) | response[17];
+
+        uint16_t crc_calculated =
+            modbus_crc16(response, 17);
+
+        if (crc_received != crc_calculated) {
+            last_err = -EBADMSG;
+
+            if (attempt == MODBUS_RETRIES) {
+                error_log_add(last_err,
+                              "CRC mismatch: rx=%04X calc=%04X",
+                              crc_received,
+                              crc_calculated);
+            }
+            continue;
+        }
+
+        return 0;
+    }
+
+    return last_err;
+}
+
+static int getMeasurement(measurement_t *m)
+{
+    static const uint8_t request[8] =
+        {0x01,0x03,0x00,0x1D,0x00,0x07,0x94,0x0E};
+
+    uint8_t response[32];
+
+    int err = modbus_read(request,
+                          sizeof(request),
+                          response,
+                          sizeof(response));
+    if (err) {
+        return err;
     }
 
     m->flow =
@@ -555,19 +672,22 @@ static int getMeasurement(measurement_t *m)
         m->timestamp = k_uptime_get();
     }
 
+    return 0;
+}
+
+int update_signal(measurement_t *m)
+{
     short rsrp_idx = 0;
     m->rsrp_dbm = -127;
-
     int ret = modem_info_short_get(MODEM_INFO_RSRP, &rsrp_idx);
     if (ret < 0) {
-        printk("Failed to get RSRP (err=%d, idx=%d)\n",
-               ret, rsrp_idx);
-    } else {
-        m->rsrp_dbm = RSRP_IDX_TO_DBM(rsrp_idx);
-        printk("RSRP = %d dBm (idx=%d)\n",
-               m->rsrp_dbm, rsrp_idx);
+        printk("Failed to get RSRP (err=%d)\n", ret);
+        return ret;
     }
-
+    m->rsrp_dbm = RSRP_IDX_TO_DBM(rsrp_idx);
+    printk("RSRP = %d dBm (idx=%d)\n",
+           m->rsrp_dbm,
+           rsrp_idx);
     return 0;
 }
 
@@ -634,6 +754,8 @@ static int publish_errors(void)
         false);
 }
 
+static bool first_boot = true;
+
 int main(void)
 {    
     printk("Initialising modem...\n");
@@ -652,12 +774,13 @@ int main(void)
 
     while (1)
     {
-        measurement_t m;
-        int rc = getMeasurement(&m);
-        if (rc == 0) {
-            measurement_log_add(&m);
-        } else {
-            error_log_add(rc, "Measurement failed: %d", rc);
+        measurement_t m = {0};
+        int rc = 0;
+        if (!first_boot) {
+            rc = getMeasurement(&m);
+            if (rc != 0) {
+                error_log_add(rc, "Measurement failed: %d", rc);
+            }
         }
         
         //run_at("AT");
@@ -672,11 +795,19 @@ int main(void)
         if (err) {
             printk("Failed to connect network: %d\n", err);
             error_log_add(err, "Failed to connect network: %d", err);
-            lte_lc_power_off();
+            if (!first_boot && rc == 0) {
+                measurement_log_add(&m);
+            }
+            err = lte_lc_power_off();
+            if (err) {
+                error_log_add(err,
+                    "Failed to power off modem: %d",
+                    err);
+            }
             sleep_until_next_wakeup();
             continue;
         }
-      
+
         if (!date_time_is_valid()) {
             err = date_time_update_async(NULL);
             if (err) {
@@ -688,6 +819,19 @@ int main(void)
                 k_sleep(K_SECONDS(1));
             }
         }
+
+        if (first_boot) {
+            printk("Cold boot complete\n");
+            error_log_add(EVENT_COLD_BOOT, "Cold boot");
+        } else if (rc == 0) {
+            int sig_rc = update_signal(&m);
+            if (sig_rc) {
+                printk("Failed to read RSRP: %d\n", sig_rc);
+                m.rsrp_dbm = -127;
+            }
+            measurement_log_add(&m);
+        }
+        first_boot = false;
 
         //k_sleep(K_SECONDS(20));
 
