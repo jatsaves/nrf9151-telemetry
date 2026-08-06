@@ -43,7 +43,7 @@ todo
 #define MB_UART_NODE DT_NODELABEL(uart1)
 #define SLEEP_INTERVAL_S (60 * 60)
 
-#define FW_VERSION "0.6.2"
+#define FW_VERSION "0.6.3"
 #define DEVICE_NAME "nrf1"
 #define MQTT_TOPIC "devices/" DEVICE_NAME
 #define EVENT_COLD_BOOT 1000
@@ -744,7 +744,9 @@ int main(void)
             error_log_add(err, "Failed to set normal mode: %d", err);
         }
         printk("Before LTE connect\n");
+        int64_t t0 = k_uptime_get();
         err = lte_lc_connect();
+        int64_t elapsed = k_uptime_get() - t0;
         printk("After LTE connect, err=%d\n", err);
         if (err) {
             printk("Failed to connect network: %d\n", err);
@@ -752,6 +754,19 @@ int main(void)
             if (!first_boot && rc == 0) {
                 measurement_log_add(&m);
             }
+            enum lte_lc_nw_reg_status reg = LTE_LC_NW_REG_NOT_REGISTERED;
+            short rsrp_idx = 0;
+            int rsrp_dbm = -127;
+            (void)lte_lc_nw_reg_status_get(&reg);
+            if (modem_info_short_get(MODEM_INFO_RSRP, &rsrp_idx) == 0) {
+                rsrp_dbm = RSRP_IDX_TO_DBM(rsrp_idx);
+            }
+            error_log_add(err,
+                "LTE connect failed: err=%d reg=%d rsrp=%d time=%lldms",
+                err,
+                reg,
+                rsrp_dbm,
+                (long long)elapsed);
             err = lte_lc_power_off();
             if (err) {
                 error_log_add(err,
