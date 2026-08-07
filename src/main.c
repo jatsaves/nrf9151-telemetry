@@ -43,7 +43,7 @@ todo
 #define MB_UART_NODE DT_NODELABEL(uart1)
 #define SLEEP_INTERVAL_S (60 * 60)
 
-#define FW_VERSION "0.6.3"
+#define FW_VERSION "0.6.4"
 #define DEVICE_NAME "nrf1"
 #define MQTT_TOPIC "devices/" DEVICE_NAME
 #define EVENT_COLD_BOOT 1000
@@ -151,6 +151,8 @@ static void error_log_add(int32_t error_code,
               fmt,
               args);
     va_end(args);
+
+    printk("[ERROR] code=%d: %s\n", (int)error_code, entry->message);
 
     error_head = (error_head + 1) % ERROR_HISTORY_SIZE;
 
@@ -458,7 +460,7 @@ static int mqtt_publish_method(const char *payload)
 
     err = mqtt_connect(&client);
     if (err) {
-        printk("mqtt_connect failed: %d\n", err);
+        error_log_add(err, "MQTT connect failed: %d", err);
         return err;
     }
 
@@ -482,7 +484,7 @@ static int mqtt_publish_method(const char *payload)
     }
 
     if (!mqtt_connected) {
-        printk("MQTT connection timed out\n");
+        error_log_add(-ETIMEDOUT, "MQTT CONNACK timed out");
         (void)mqtt_disconnect(&client, NULL);
         return -ETIMEDOUT;
     }
@@ -511,7 +513,7 @@ static int mqtt_publish_method(const char *payload)
 
     err = mqtt_publish(&client, &param);
     if (err) {
-        printk("mqtt_publish failed: %d\n", err);
+        error_log_add(err, "MQTT publish failed: %d", err);
         (void)mqtt_disconnect(&client, NULL);
         return err;
     }
@@ -690,15 +692,17 @@ static int publish_logs(void)
 
     char payload[1536];
 
-    int err = build_payload(payload, sizeof(payload));
+int err = build_payload(payload, sizeof(payload));
     if (err) {
-        printk("Payload build failed: %d\n", err);
+        measurement_log_clear();
+        error_log_clear();
+        error_log_add(err, "Payload build failed: %d. Logs wiped to recover.", err);
         return err;
     }
 
     err = mqtt_publish_method(payload);
     if (err) {
-        printk("MQTT publish failed: %d\n", err);
+        error_log_add(err, "MQTT publish failed: %d", err);
         return err;
     }
 
@@ -740,7 +744,6 @@ int main(void)
         //run_at("AT");
         err = lte_lc_normal(); //int err = lte_lc_func_mode_set(LTE_LC_FUNC_MODE_NORMAL); //run_at("AT+CFUN=1");
         if (err) {
-            printk("Failed to set normal mode: %d\n", err);
             error_log_add(err, "Failed to set normal mode: %d", err);
         }
         printk("Before LTE connect\n");
@@ -749,7 +752,6 @@ int main(void)
         int64_t elapsed = k_uptime_get() - t0;
         printk("After LTE connect, err=%d\n", err);
         if (err) {
-            printk("Failed to connect network: %d\n", err);
             error_log_add(err, "Failed to connect network: %d", err);
             if (!first_boot && rc == 0) {
                 measurement_log_add(&m);
@@ -780,7 +782,6 @@ int main(void)
         if (!date_time_is_valid()) {
             err = date_time_update_async(NULL);
             if (err) {
-                printk("Failed to request network time: %d\n", err);
                 error_log_add(err, "Failed to request network time: %d", err);
             }
 
@@ -790,7 +791,6 @@ int main(void)
         }
 
         if (first_boot) {
-            printk("Cold boot complete\n");
             error_log_add(EVENT_COLD_BOOT, "Cold boot");
         } else if (rc == 0) {
             int sig_rc = update_signal(&m);
@@ -815,7 +815,6 @@ int main(void)
 
         err = lte_lc_power_off(); //err = lte_lc_func_mode_set(LTE_LC_FUNC_MODE_POWER_OFF);
         if (err) {
-            printk("Failed to power off modem: %d\n", err);
             error_log_add(err, "Failed to power off modem: %d", err);
         }
 
